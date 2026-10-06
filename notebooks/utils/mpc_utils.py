@@ -45,19 +45,28 @@ def cem(
     close_gripper=None,
 ):
     """
-    :param context_frame: [B=1, T=1, HW, D]
-    :param goal_frame: [B=1, T=1, HW, D]
-    :param world_model: f(context_frame, action) -> next_frame [B, 1, HW, D]
-    :return: [B=1, rollout, 7] an action trajectory over rollout horizon
+    【基于世界模型 (World Model) 与交叉熵方法 (CEM) 的模型预测控制 (MPC)】
 
-    Cross-Entropy Method
-    -----------------------
-    1. for rollout horizon:
-    1.1. sample several actions
-    1.2. compute next states using WM
-    3. compute similarity of final states to goal_frames
-    4. select topk samples and update mean and std using topk action trajs
-    5. choose final action to be mean of distribution
+    核心思想：
+    在具身智能中，有了隐空间世界模型后，机械臂不需要真的去物理世界试错，
+    而是在“脑海中的虚拟物理引擎 (Latent World Model)”里进行前向推演：
+    1. 机械臂当前处于 context_frame，目标是达到 goal_frame；
+    2. 随机生成 samples 条不同的候选动作轨迹 (Action Trajectories)；
+    3. 利用世界模型向前推演 rollout 步，预测出每一条轨迹最终产生的未来视觉表征；
+    4. 计算推演出的未来表征与目标 goal_frame 的隐空间 L1 距离（目标代价）；
+    5. 挑选出效果最好的前 topk 个精英动作，更新动作高斯分布的均值 (mean) 与方差 (std)；
+    6. 迭代优化 cem_steps 次后，收敛出的均值分布即为最优执行动作！
+
+    参数解析：
+    :param context_frame: 当前观察帧的隐特征 [B=1, T=1, HW, D] (例如 1x1x196x1024)
+    :param context_pose: 机械臂当前本体位姿 (7 维: 3 维平移 + 3 维旋转/四元数 + 1 维夹爪)
+    :param goal_frame: 目标期望达到的视觉帧特征 [B=1, T=1, HW, D]
+    :param world_model: 具身世界模型包装器 f(frames, actions, poses) -> next_frame
+    :param rollout: 向未来预测推演的时间步长 (Horizon)
+    :param cem_steps: 交叉熵迭代优化轮数 (例如 100 轮)
+    :param samples: 每轮采样的动作候选数量 (例如 100 条并行轨迹)
+    :param topk: 每轮挑选出的精英轨迹数量 (例如选前 10 条最优轨迹更新分布)
+    :return: [B=1, rollout, 7] 规划出的最优动作控制序列
     """
     context_frame = context_frame.repeat(samples, 1, 1, 1)  # Reshape to [S, 1, HW, D]
     goal_frame = goal_frame.repeat(samples, 1, 1, 1)  # Reshape to [S, 1, HW, D]
@@ -84,12 +93,11 @@ def cem(
         mean[:, ax] = axis[ax]
 
     def sample_action_traj():
-        """Sample several action trajectories"""
+        """从当前高斯分布采样多条动作序列，并用世界模型在隐空间前向推演未来状态"""
         action_traj, frame_traj, pose_traj = None, context_frame, context_pose
 
         for h in range(rollout):
-
-            # -- sample new action
+            # 1. 采样新的动作候选 (平移 + 旋转 + 夹爪)
             action_samples = torch.randn(samples, mean.size(1), device=mean.device) * std[h] + mean[h]
             action_samples[:, :3] = torch.clip(action_samples[:, :3], min=-maxnorm, max=maxnorm)
             action_samples[:, -1:] = torch.clip(action_samples[:, -1:], min=-0.75, max=0.75)
@@ -110,7 +118,7 @@ def cem(
                 torch.cat([action_traj, action_samples], dim=1) if action_traj is not None else action_samples
             )
 
-            # -- compute next state
+            # 2. 核心：调用隐空间世界模型向前推演一步未来的视觉特征 next_frame 与位姿 next_pose
             next_frame, next_pose = world_model(frame_traj, action_traj, pose_traj)
             frame_traj = torch.cat([frame_traj, next_frame], dim=1)
             pose_traj = torch.cat([pose_traj, next_pose], dim=1)
@@ -118,8 +126,9 @@ def cem(
         return action_traj, frame_traj
 
     def select_topk_action_traj(final_state, goal_state, actions):
-        """Get the topk action trajectories that bring us closest to goal"""
+        """在隐空间计算推演出的最终状态与目标状态之间的 L1 距离，挑选出最接近目标的 top-k 条最优动作"""
         sims = objective(final_state.flatten(1), goal_state.flatten(1))
+        # 寻找距离最小 (即最相似) 的 top-k 个样本索引
         indices = sims.topk(topk, largest=False).indices
         selected_actions = actions[indices]
         return selected_actions

@@ -52,6 +52,11 @@ def make_videodataset(
     deterministic=True,
     log_dir=None,
 ):
+    """
+    【构建视频数据集与 DataLoader 工厂函数】
+    用于在分布式训练环境下，将海量无标签视频按指定的帧率 (fps)、时序跨度 (frame_step) 和片段长度 (frames_per_clip)
+    打包为 PyTorch DataLoader。结合 collator (如 MaskCollator) 同时输出遮挡掩码。
+    """
     dataset = VideoDataset(
         data_paths=data_paths,
         datasets_weights=datasets_weights,
@@ -119,7 +124,10 @@ def make_videodataset(
 
 
 class VideoDataset(torch.utils.data.Dataset):
-    """Video classification dataset."""
+    """
+    【视频基础数据集类 (VideoDataset)】
+    使用 decord 高性能 C++ 视频解码库，直接从 mp4/webm 文件中按帧索引按需解码并输出张量。
+    """
 
     def __init__(
         self,

@@ -17,7 +17,28 @@ from src.utils.tensors import trunc_normal_
 
 
 class VisionTransformer(nn.Module):
-    """Vision Transformer"""
+    """
+    【V-JEPA 2 核心视觉编码器 (Vision Transformer, ViT)】
+
+    角色与核心定位：
+    在 V-JEPA 2 架构中，该模型既扮演【上下文编码器 (Context Encoder)】，
+    又通过 EMA 动量权重更新扮演【目标编码器 (Target Encoder)】：
+    1. 当作为上下文编码器时 (Context Encoder)：
+       - 接收原始视频切块后，传入 masks (未遮挡的上下文索引)；
+       - 通过 apply_masks 仅保留未遮挡的 Patches（通常仅占视频总块数的 15%~30%）；
+       - 这样 ViT 只需计算少量 Tokens，节省 70%~85% 的显存与计算量！
+    2. 当作为目标编码器时 (Target Encoder)：
+       - 不传 masks，输入完整视频；
+       - 提取全部时空 Patches 的无梯度、高层抽象语义特征，供预测器去比对学习。
+
+    主要输入输出：
+    - 输入：
+      - 静态图像: [B, C, H, W]
+      - 动态视频: [B, C, T, H, W]  (C=3, T=帧数, H=高, W=宽)
+      - masks (可选): List[Tensor]，指定哪些时空块被选中保留输入给 Transformer Block
+    - 输出：
+      - 特征张量: [B, N_tokens, D] (例如 [1, 2048, 1024])，每个 Token 代表一个时空立方体的高层语义。
+    """
 
     def __init__(
         self,
@@ -160,18 +181,21 @@ class VisionTransformer(nn.Module):
 
     def forward(self, x, masks=None):
         """
-        :param x: input image/video
-        :param masks: indices of patch tokens to mask (remove)
+        前向传播函数：
+        :param x: 输入图像 [B, C, H, W] 或 视频 [B, C, T, H, W]
+        :param masks: 掩码索引列表 (由 multiseq_multiblock3d.py 生成)
+                      - 若为 None (如作为 Target Encoder 时)：处理全部时空块；
+                      - 若传入索引 (如作为 Context Encoder 时)：只提取并计算上下文块。
         """
         if masks is not None and not isinstance(masks, list):
             masks = [masks]
 
-        # Tokenize input
-        # Image
+        # 1. 解析输入的时空维度
+        # 静态图像
         if x.ndim == 4:
             _, _, H, W = x.shape
             T = 1
-        # Video
+        # 视频序列: 计算在时间维度上的 Tubelet 数量 T_patches = T // tubelet_size
         elif x.ndim == 5:
             _, _, T, H, W = x.shape
             T = T // self.tubelet_size
@@ -180,19 +204,26 @@ class VisionTransformer(nn.Module):
         if not self.handle_nonsquare_inputs:
             T = H_patches = W_patches = None
 
+        # 2. 分块卷积与位置编码 (Tubelet Embedding + Pos Embedding)
         if not self.use_rope:
+            # 动态插值或切片 3D 正弦余弦位置编码以匹配当前的帧数与分辨率
             pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)
+            # 经过 3D 卷积将 [B, C, T, H, W] 投影为 [B, N_patches, D]
             x = self.patch_embed(x)
+            # 注入绝对 3D 时空位置编码
             x += pos_embed
         else:
+            # 如果使用旋转位置编码 (RoPE)，位置信息会在每个注意力层动态注入
             x = self.patch_embed(x)
 
-        # Mask away unwanted tokens (if masks provided)
+        # 3. 掩码操作：丢弃被遮挡的 Patches (仅针对 Context Encoder)
         if masks is not None:
+            # apply_masks 利用 torch.gather 仅挑选出未遮挡的上下文 Token 序列
+            # x 从 [B, N_total, D] 缩减为 [B, N_context, D]
             x = apply_masks(x, masks)
             masks = torch.cat(masks, dim=0)
 
-        # Fwd prop
+        # 4. 前向通过多层 Transformer Block
         outs = []
         for i, blk in enumerate(self.blocks):
             if self.use_activation_checkpointing:

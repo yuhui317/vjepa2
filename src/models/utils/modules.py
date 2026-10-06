@@ -10,6 +10,23 @@ from timm.models.layers import drop_path
 
 
 def build_action_block_causal_attention_mask(T, H, W, add_tokens=1):
+    """
+    【构建具身动作-时空块因果注意力掩码 (Block Causal Attention Mask)】
+
+    核心原理：
+    在具身智能世界模型 (V-JEPA 2-AC) 中，机械臂控制是一条时间因果链：
+    当前步 t 的状态预测只能依赖于历史时刻 1 到 t 的视觉表征与动作，严禁偷看未来时刻 t+1 的信息！
+
+    每个时间步包含：
+    - add_tokens: 动作 Token (与机器人位姿 Token)，例如 1 或 2 个；
+    - H * W: 当前时间步切分出的所有视觉 Patch Tokens。
+    总共每个时间步有 N_T = add_tokens + H * W 个 Tokens。
+
+    掩码矩阵形态：
+    生成一个 [N, N] 的布尔矩阵 (N = T * N_T)：
+    在第 t1 步行块中，仅对 t2 <= t1 的列块设为 True (可见)，对 t2 > t1 的未来列块设为 False (遮蔽)。
+    同时在同一个时间步内部 (t1 == t2)，动作 Token 与视觉 Tokens 之间是双向全连接的。
+    """
     N_T = add_tokens + (H * W)
     N = T * N_T
     mask = torch.zeros(N, N).bool()

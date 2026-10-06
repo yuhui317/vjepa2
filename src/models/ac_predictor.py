@@ -15,7 +15,22 @@ from src.utils.tensors import trunc_normal_
 
 
 class VisionTransformerPredictorAC(nn.Module):
-    """Action Conditioned Vision Transformer Predictor"""
+    """
+    【动作条件预测器 (Action-Conditioned Vision Transformer Predictor / V-JEPA 2-AC)】
+
+    具身智能与世界模型 (World Model) 的核心灵魂：
+    在普通的 V-JEPA 中，预测器只根据无动作的上下文预测被遮挡的视频块。
+    而在机器人/具身智能任务中，环境的未来演变是由“机器人的控制动作 (Action)”所驱动的！
+
+    V-JEPA 2-AC (Action-Conditioned) 的设计：
+    1. 冻结预训练好的视觉编码器 (Frozen ViT Encoder)；
+    2. 将机械臂当前的本体感知状态 (State，如 7 自由度关节角/末端位姿) 和执行的动作 (Action) 投影为 Token；
+    3. 将动作 Token、状态 Token 与当前帧的视觉 Patches 进行交织拼接；
+    4. 采用时间因果注意力掩码 (Temporal Causal Attention Mask)，确保预测 t+1 步时只能看到 <=t 步的历史视觉与动作；
+    5. 在隐空间预测下一时刻 $s_{t+1}$ 的视觉表征！
+
+    这构成了可用于模型预测控制 (MPC) 和策略评估的完全可导的“隐空间神经物理模拟器”！
+    """
 
     def __init__(
         self,
@@ -49,13 +64,13 @@ class VisionTransformerPredictorAC(nn.Module):
         self.is_frame_causal = is_frame_causal
         self.use_extrinsics = use_extrinsics
 
-        # Map input to predictor dimension
+        # 线性映射层：将视觉特征、机器人动作 (Action)、机器人状态 (State) 统一映射到预测器隐空间维度
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
         self.action_encoder = nn.Linear(action_embed_dim, predictor_embed_dim, bias=True)
         self.state_encoder = nn.Linear(action_embed_dim, predictor_embed_dim, bias=True)
         self.extrinsics_encoder = nn.Linear(action_embed_dim - 1, predictor_embed_dim, bias=True)
 
-        # Determine positional embedding
+        # 视频与图像网格尺寸
         if type(img_size) is int:
             img_size = (img_size, img_size)
         self.img_height, self.img_width = img_size
@@ -69,12 +84,12 @@ class VisionTransformerPredictorAC(nn.Module):
         self.grid_width = img_size[1] // self.patch_size
         self.use_activation_checkpointing = use_activation_checkpointing
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # 随机深度衰减率
 
-        # Position embedding
+        # 位置编码参数
         self.uniform_power = uniform_power
 
-        # Attention Blocks
+        # 堆叠的注意力块 (ACBlock: 支持因果掩码与 RoPE 旋转位置编码)
         self.use_rope = use_rope
         self.predictor_blocks = nn.ModuleList(
             [
@@ -97,15 +112,17 @@ class VisionTransformerPredictorAC(nn.Module):
             ]
         )
 
-        # Normalize & project back to input dimension
+        # 输出层归一化与投影回原特征空间
         self.predictor_norm = norm_layer(predictor_embed_dim)
         self.predictor_proj = nn.Linear(predictor_embed_dim, embed_dim, bias=True)
 
-        # ------ initialize weights
+        # ------ 初始化权重
         self.init_std = init_std
         self.apply(self._init_weights)
         self._rescale_blocks()
 
+        # 构建因果注意力掩码 (Causal Attention Mask)
+        # 保证时间维度上的单向因果性：当前时刻的状态和动作只能影响未来，不能倒流到过去
         attn_mask = None
         if self.is_frame_causal:
             grid_depth = self.num_frames // self.tubelet_size
@@ -135,17 +152,28 @@ class VisionTransformerPredictorAC(nn.Module):
 
     def forward(self, x, actions, states, extrinsics=None):
         """
-        :param x: context tokens
+        【动作条件前向推演 (Action-Conditioned Forward Rollout)】
+
+        参数:
+        :param x: 视觉上下文 Tokens，形状 [B, N_ctxt, D]
+        :param actions: 机器人执行的控制动作向量，如末端位移或关节速度 [B, T, action_dim]
+        :param states: 机器人本体感知状态向量，如位姿/角度 [B, T, state_dim]
+        :param extrinsics: 相机外参（可选）
+
+        返回:
+        :return x: 在施加给定动作序列后，预测的未来视觉隐表征序列
         """
-        # Map tokens to predictor dimensions
+        # 步骤 1: 视觉特征映射到预测器维度
         x = self.predictor_embed(x)
         B, N_ctxt, D = x.size()
         T = N_ctxt // (self.grid_height * self.grid_width)
 
-        # Interleave action tokens
-        s = self.state_encoder(states).unsqueeze(2)
-        a = self.action_encoder(actions).unsqueeze(2)
+        # 步骤 2: 将动作 (Action) 和状态 (State) 编码为 Token，并在每个时间步交织拼接
+        s = self.state_encoder(states).unsqueeze(2)  # [B, T, 1, D]
+        a = self.action_encoder(actions).unsqueeze(2)  # [B, T, 1, D]
         x = x.view(B, T, self.grid_height * self.grid_width, D)  # [B, T, H*W, D]
+
+        # 每个时间步包含：[动作 a_t, 状态 s_t, 图像 Patches_t]
         if self.use_extrinsics:
             e = self.extrinsics_encoder(extrinsics).unsqueeze(2)
             x = torch.cat([a, s, e, x], dim=2).flatten(1, 2)  # [B, T*(H*W+3), D]
@@ -155,7 +183,7 @@ class VisionTransformerPredictorAC(nn.Module):
         cond_tokens = 3 if self.use_extrinsics else 2
         attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
 
-        # Fwd prop
+        # 步骤 3: 带有因果掩码的 Transformer 深度推演
         for i, blk in enumerate(self.predictor_blocks):
             if self.use_activation_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
@@ -180,10 +208,11 @@ class VisionTransformerPredictorAC(nn.Module):
                     action_tokens=cond_tokens,
                 )
 
-        # Split out action and frame tokens
+        # 步骤 4: 剥离条件 Tokens (去掉 a_t 和 s_t)，只保留未来视频 Patches 的预测表征
         x = x.view(B, T, cond_tokens + self.grid_height * self.grid_width, D)  # [B, T, K+H*W, D]
         x = x[:, :, cond_tokens:, :].flatten(1, 2)
 
+        # 步骤 5: 归一化并投影回原视觉特征维度
         x = self.predictor_norm(x)
         x = self.predictor_proj(x)
 

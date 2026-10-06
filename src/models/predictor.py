@@ -16,7 +16,23 @@ from src.utils.tensors import repeat_interleave_batch, trunc_normal_
 
 
 class VisionTransformerPredictor(nn.Module):
-    """Vision Transformer"""
+    """
+    【JEPA 预测器 (Vision Transformer Predictor)】
+
+    核心作用：
+    这是 V-JEPA 架构的核心组件之一。
+    JEPA 不像 MAE 那样去在像素空间做微观重建（比如预测 RGB 像素值），
+    而是在“隐空间 (Latent/Representation Space)”中进行宏观语义预测。
+
+    预测器接收：
+    1. 上下文 Tokens (Context Tokens): 由 Encoder 从未被遮挡的视频块中提取的特征向量；
+    2. 目标可学习 Mask Tokens (Target Mask Tokens): 带有目标时空位置编码的占位符向量；
+
+    预测器输出：
+    预测被遮挡区域在目标编码器 (Target Encoder) 中的高层隐特征表示。
+    由于只预测隐空间特征，模型被迫学习视频中的物体动力学、连续运动规律和高层物理语义，
+    而不会把容量浪费在高频噪声、纹理细节或光影渐变上。
+    """
 
     def __init__(
         self,
@@ -53,10 +69,11 @@ class VisionTransformerPredictor(nn.Module):
         self.return_all_tokens = return_all_tokens
         self.chop_last_n_tokens = chop_last_n_tokens
 
-        # Map input to predictor dimension
+        # 将 Encoder 的输出特征维度 (embed_dim) 映射到预测器内部维度 (predictor_embed_dim)
+        # 注意：预测器通常比编码器更窄更浅（如 6 层 vs 编码器 24 层），降低计算量
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
 
-        # Mask tokens
+        # 可学习的掩码占位符 (Mask Tokens)
         self.mask_tokens = None
         self.num_mask_tokens = 0
         if use_mask_tokens:
@@ -65,7 +82,7 @@ class VisionTransformerPredictor(nn.Module):
                 [nn.Parameter(torch.zeros(1, 1, predictor_embed_dim)) for i in range(num_mask_tokens)]
             )
 
-        # Determine positional embedding
+        # 确定图像/视频网格尺寸与位置编码
         if type(img_size) is int:
             img_size = (img_size, img_size)
         self.img_height, self.img_width = img_size
@@ -80,7 +97,7 @@ class VisionTransformerPredictor(nn.Module):
         self.grid_depth = num_frames // self.tubelet_size
         self.use_activation_checkpointing = use_activation_checkpointing
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # 随机深度衰减规则
 
         if self.is_video:
             self.num_patches = num_patches = (
@@ -88,7 +105,8 @@ class VisionTransformerPredictor(nn.Module):
             )
         else:
             self.num_patches = num_patches = (img_size[0] // patch_size) * (img_size[1] // patch_size)
-        # Position embedding
+
+        # 位置编码 (Position Embedding)
         self.uniform_power = uniform_power
 
         self.predictor_pos_embed = None
@@ -97,7 +115,7 @@ class VisionTransformerPredictor(nn.Module):
                 torch.zeros(1, num_patches, predictor_embed_dim), requires_grad=False
             )
 
-        # Attention Blocks
+        # 堆叠 Transformer 注意力层 (Attention Blocks)
         self.use_rope = use_rope
         self.predictor_blocks = nn.ModuleList(
             [
@@ -128,13 +146,13 @@ class VisionTransformerPredictor(nn.Module):
             else:
                 out_embed_dim = embed_dim
 
-        # Normalize & project back to input dimension
+        # 归一化层与输出投影层：将预测器内部维度映射回目标编码器的特征维度 (out_embed_dim)
         self.predictor_norm = norm_layer(predictor_embed_dim)
         self.predictor_proj = nn.Linear(predictor_embed_dim, out_embed_dim, bias=True)
 
-        # ------ initialize weights
+        # ------ 初始化权重
         if self.predictor_pos_embed is not None:
-            self._init_pos_embed(self.predictor_pos_embed.data)  # sincos pos-embed
+            self._init_pos_embed(self.predictor_pos_embed.data)  # 正弦余弦 3D 位置编码
         self.init_std = init_std
         if not zero_init_mask_tokens:
             for mt in self.mask_tokens:
@@ -144,7 +162,7 @@ class VisionTransformerPredictor(nn.Module):
 
     def _init_pos_embed(self, pos_embed):
         embed_dim = pos_embed.size(-1)
-        grid_size = self.img_height // self.patch_size  # TODO: update; currently assumes square input
+        grid_size = self.img_height // self.patch_size
         if self.is_video:
             grid_depth = self.num_frames // self.tubelet_size
             sincos = get_3d_sincos_pos_embed(
@@ -173,9 +191,20 @@ class VisionTransformerPredictor(nn.Module):
 
     def forward(self, x, masks_x, masks_y, mask_index=1, has_cls=False):
         """
-        :param x: context tokens
-        :param masks_x: indices of context tokens in input
-        :params masks_y: indices of target tokens in input
+        【预测器前向传播】
+
+        工作流程：
+        1. 投影上下文 Tokens 到 predictor 维度；
+        2. 给上下文 Tokens 加上各自对应的 3D 时空位置编码；
+        3. 构造目标预测 Tokens (可学习的 mask_token + 目标区域的 3D 时空位置编码)；
+        4. 拼接上下文 Tokens 与目标预测 Tokens；
+        5. 按原始 Patch 空间/时间索引重新排序（保持时空相对顺序）；
+        6. 送入 Transformer 注意力块进行多层交互预测；
+        7. 抽取对应于目标区域的输出，投影回目标维度进行特征回归！
+
+        :param x: 上下文特征 Tokens，形状 [B, N_ctxt, D]
+        :param masks_x: 上下文 Patches 在原始视频中的索引列表
+        :param masks_y: 待预测的目标 Patches 在原始视频中的索引列表
         """
         assert (masks_x is not None) and (masks_y is not None), "Cannot run predictor without mask indices"
         if not isinstance(masks_x, list):
@@ -183,48 +212,50 @@ class VisionTransformerPredictor(nn.Module):
         if not isinstance(masks_y, list):
             masks_y = [masks_y]
 
-        # Batch Size
+        # 批大小 Batch Size
         B = len(x) // len(masks_x)
 
-        # Map context tokens to predictor dimensions
+        # 步骤 1: 映射上下文 Tokens 到预测器维度
         x = self.predictor_embed(x)
         if has_cls:
             x_cls = x[:, :1, :]
             x = x[:, 1:, :]
         _, N_ctxt, D = x.shape
 
-        # Add positional embedding to ctxt tokens
+        # 步骤 2: 为上下文 Tokens 加上对应的 3D 时空位置编码
         if not self.use_rope:
             x_pos_embed = self.predictor_pos_embed.repeat(B, 1, 1)
             x += apply_masks(x_pos_embed, masks_x)
 
-        # Make target tokens
+        # 步骤 3: 构造目标 Tokens (可学习占位符向量 + 目标时空位置编码)
+        # “告诉我这里是什么位置，我来预测这里应该有什么特征”
         mask_index = mask_index % self.num_mask_tokens
         pred_tokens = self.mask_tokens[mask_index]
         pred_tokens = pred_tokens.repeat(B, self.num_patches, 1)
         pred_tokens = apply_masks(pred_tokens, masks_y)
-        # -- add pos embed
+        # -- 加上目标区域专属的时空位置编码
         if not self.use_rope:
             pos_embs = self.predictor_pos_embed.repeat(B, 1, 1)
             pos_embs = apply_masks(pos_embs, masks_y)
             pos_embs = repeat_interleave_batch(pos_embs, B, repeat=len(masks_x))
             pred_tokens += pos_embs
 
-        # Concatenate context & target tokens
+        # 步骤 4: 拼接上下文 Tokens 与待预测的目标 Tokens
         x = x.repeat(len(masks_x), 1, 1)
         x = torch.cat([x, pred_tokens], dim=1)
 
-        # Positions of context & target tokens
+        # 记录所有 Tokens (上下文 + 目标) 在原视频中的时空绝对位置
         masks_x = torch.cat(masks_x, dim=0)
         masks_y = torch.cat(masks_y, dim=0)
         masks = torch.cat([masks_x, masks_y], dim=1)
 
-        # Put tokens in sorted order
+        # 步骤 5: 按照时空网格自然顺序 (argsort) 进行排序
+        # 这保证了序列里的时空拓扑关系一致，便于自注意力机制捕捉局部临近关系
         argsort = torch.argsort(masks, dim=1)  # [B, N]
         masks = torch.stack([masks[i, row] for i, row in enumerate(argsort)], dim=0)
         x = torch.stack([x[i, row, :] for i, row in enumerate(argsort)], dim=0)
 
-        # Remove the last n tokens of sorted sequence before processing
+        # 预留裁剪 Tokens 的选项
         if self.chop_last_n_tokens > 0:
             x = x[:, : -self.chop_last_n_tokens]
             masks = masks[:, : -self.chop_last_n_tokens]
@@ -232,7 +263,7 @@ class VisionTransformerPredictor(nn.Module):
         if has_cls:
             x = torch.cat([x_cls, x], dim=1)
 
-        # Fwd prop
+        # 步骤 6: 通过多层 Transformer 注意力块进行深度特征交互
         for i, blk in enumerate(self.predictor_blocks):
             if self.use_activation_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(blk, x, masks, None, use_reentrant=False)
@@ -243,12 +274,14 @@ class VisionTransformerPredictor(nn.Module):
         if has_cls:
             x = x[:, 1:, :]
 
-        # Return output corresponding to target tokens
+        # 步骤 7: 还原排序，并只剥离出属于“目标位置 (Target)”的预测特征
+        # 因为在 JEPA 中，我们只对预测出来的目标特征计算 Loss，不对上下文 Tokens 计算 Loss
         if not self.return_all_tokens:
             reverse_argsort = torch.argsort(argsort, dim=1)  # [B, N]
             x = torch.stack([x[i, row, :] for i, row in enumerate(reverse_argsort)], dim=0)
             x = x[:, N_ctxt:]
 
+        # 步骤 8: 线性投影到与 Target Encoder 输出完全一致的隐空间维度
         x = self.predictor_proj(x)
 
         return x

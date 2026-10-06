@@ -14,6 +14,13 @@ logger = getLogger()
 
 
 class MaskCollator(object):
+    """
+    【3D 时空掩码整理器 (Mask Collator)】
+
+    在 PyTorch DataLoader 取出一批视频数据时，动态生成对应的时空遮挡掩码：
+    - masks_enc (上下文掩码): 告诉 Context Encoder 哪些 Patches 是可见的；
+    - masks_pred (目标掩码): 告诉 Predictor 哪些 Patches 被遮挡了，需要预测。
+    """
 
     def __init__(
         self,
@@ -91,6 +98,15 @@ class MaskCollator(object):
 
 
 class _MaskGenerator(object):
+    """
+    【3D 时空大块遮挡生成器 (3D Spatiotemporal Block Mask Generator)】
+
+    JEPA 与传统纯随机 Patch 遮挡 (Random Masking) 的最大区别：
+    - 随机遮挡单个 patch 容易让模型利用相邻像素的插值（“走捷径”作弊），学不到高层语义。
+    - JEPA 采用“连续大块遮挡 (Block Masking)”：
+      在时间轴上持续若干帧 (Duration t)、在空间上占据连续的矩形大块 (Height h, Width w)。
+      迫使模型必须理解整个物体的运动轨迹和物理变化，才能预测出被遮挡的大块。
+    """
 
     def __init__(
         self,
@@ -130,9 +146,9 @@ class _MaskGenerator(object):
         self.npred = npred
         self.max_context_duration = max(
             1, int(self.duration * max_context_frames_ratio)
-        )  # maximum number of time-steps (frames) spanned by context mask
-        self.max_keep = max_keep  # maximum number of patches to keep in context
-        self._itr_counter = Value("i", -1)  # collator is shared across worker processes
+        )  # 上下文掩码跨越的最大时间步长
+        self.max_keep = max_keep  # 上下文保留的最大 Patches 数量
+        self._itr_counter = Value("i", -1)  # 多进程共享的计数器
         self.inv_block = inv_block
 
     def step(self):
@@ -145,24 +161,25 @@ class _MaskGenerator(object):
     def _sample_block_size(
         self, generator, temporal_scale, spatial_scale, aspect_ratio_scale
     ):
-        # -- Sample temporal block mask scale
+        """随机采样一个 3D 掩码立方体的时间深度 t、高度 h、宽度 w"""
+        # -- 1. 采样时间跨度 (覆盖多少个 tubelet 时间步)
         _rand = torch.rand(1, generator=generator).item()
         min_t, max_t = temporal_scale
         temporal_mask_scale = min_t + _rand * (max_t - min_t)
         t = max(1, int(self.duration * temporal_mask_scale))
 
-        # -- Sample spatial block mask scale
+        # -- 2. 采样空间面积比例 (遮挡整幅图的多少比例)
         _rand = torch.rand(1, generator=generator).item()
         min_s, max_s = spatial_scale
         spatial_mask_scale = min_s + _rand * (max_s - min_s)
         spatial_num_keep = int(self.height * self.width * spatial_mask_scale)
 
-        # -- Sample block aspect-ratio
+        # -- 3. 采样空间长宽比 (Aspect Ratio)
         _rand = torch.rand(1, generator=generator).item()
         min_ar, max_ar = aspect_ratio_scale
         aspect_ratio = min_ar + _rand * (max_ar - min_ar)
 
-        # -- Compute block height and width (given scale and aspect-ratio)
+        # -- 4. 计算高度 h 与宽度 w (网格单位)
         h = int(round(math.sqrt(spatial_num_keep * aspect_ratio)))
         w = int(round(math.sqrt(spatial_num_keep / aspect_ratio)))
         h = min(h, self.height)
@@ -171,6 +188,7 @@ class _MaskGenerator(object):
         return (t, h, w)
 
     def _sample_block_mask(self, b_size):
+        """在 3D 时空网格中随机指定起始位置，扣出一个大块"""
         t, h, w = b_size
         top = torch.randint(0, self.height - h + 1, (1,))
         left = torch.randint(0, self.width - w + 1, (1,))

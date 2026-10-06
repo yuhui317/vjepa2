@@ -422,40 +422,64 @@ def main(args, resume_preempt=False):
                 gc.collect()
 
             def train_step():
+                """
+                【单步训练的核心前向与反向传播逻辑】
+
+                标准 JEPA 训练的 3 个阶段：
+                1. 目标编码 (forward_target):
+                   完整视频送入 Target Encoder（无梯度），计算目标隐特征 h，并进行 LayerNorm。
+                2. 上下文预测 (forward_context):
+                   被遮挡后的上下文视频 Patches 送入 Context Encoder 得到上下文特征，
+                   再与带有位置信息的 Mask Tokens 一起送入 Predictor，得到对被遮挡区域的预测特征 z。
+                3. 计算隐空间 L1 损失 (loss_fn):
+                   仅对被遮挡区域 (masks_pred) 计算预测特征 z 与真实目标特征 h 之间的 L1 距离。
+                4. 反向传播更新 Encoder 和 Predictor 的参数。
+                5. 动量更新目标编码器 (EMA Update):
+                   Target Encoder 的参数不走梯度反传，而是通过指数移动平均 (EMA) 跟踪 Context Encoder：
+                   \theta_{target} \leftarrow m \cdot \theta_{target} + (1 - m) \cdot \theta_{context}
+                   这避免了特征崩溃 (Representation Collapse)，保证了表征的稳定性。
+                """
                 _new_lr = scheduler.step()
                 _new_wd = wd_scheduler.step()
                 # --
 
+                # 【1. 目标网络前向】输入完整视频片段，不计算梯度
                 def forward_target(c):
                     with torch.no_grad():
                         h = target_encoder(c)
+                        # 对每个视频片段的输出特征做 LayerNorm 归一化，防止特征发散
                         h = [F.layer_norm(hi, (hi.size(-1),)) for hi in h]
                         return h
 
+                # 【2. 上下文与预测网络前向】
                 def forward_context(c):
+                    # (a) 编码器仅处理可见的上下文 Patches (极大节省计算显存)
                     z = encoder(c, masks_enc)
+                    # (b) 预测器接收上下文特征并预测被遮挡的目标 Patches
                     z = predictor(z, masks_enc, masks_pred)
                     return z
 
+                # 【3. 隐空间损失函数】
                 def loss_fn(z, h):
-                    # Assumption: predictor will have returned only masked tokens for z
+                    # 从完整特征 h 中，利用 apply_masks 抽取被掩码遮挡的目标区域真实特征
                     h = [apply_masks(hi, mi, concat=False) for hi, mi in zip(h, masks_pred)]
 
                     loss, n = 0, 0
                     for zi, hi in zip(z, h):
                         for zij, hij in zip(zi, hi):
+                            # 计算预测隐特征与真实目标隐特征的 Smooth L1 / L1 距离
                             loss += torch.mean(torch.abs(zij - hij) ** loss_exp) / loss_exp
                             n += 1
                     loss /= n
                     return loss
 
-                # Step 1. Forward
+                # 步骤 1. 前向传播计算 Loss (混合精度加速)
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    h = forward_target(clips)
-                    z = forward_context(clips)
-                    loss = loss_fn(z, h)  # jepa prediction loss
+                    h = forward_target(clips)       # 目标特征 (Teacher)
+                    z = forward_context(clips)      # 预测特征 (Student)
+                    loss = loss_fn(z, h)            # JEPA 隐空间预测损失
 
-                # Step 2. Backward & step
+                # 步骤 2. 梯度反向传播与优化器步进 (只更新 context encoder 和 predictor)
                 if mixed_precision:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
@@ -468,7 +492,8 @@ def main(args, resume_preempt=False):
                     optimizer.step()
                 optimizer.zero_grad()
 
-                # Step 3. momentum update of target encoder
+                # 步骤 3. 目标编码器的动量平滑更新 (EMA - Exponential Moving Average)
+                # 动量系数 m 随训练步数逐渐接近 1 (例如从 0.996 到 1.0)
                 m = next(momentum_scheduler)
                 with torch.no_grad():
                     params_k = []
@@ -476,6 +501,7 @@ def main(args, resume_preempt=False):
                     for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
                         params_k.append(param_k)
                         params_q.append(param_q)
+                    # target = m * target + (1 - m) * context
                     torch._foreach_mul_(params_k, m)
                     torch._foreach_add_(params_k, params_q, alpha=1 - m)
 
